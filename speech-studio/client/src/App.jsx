@@ -4,6 +4,7 @@ import TextInput from './components/TextInput';
 import SpeechSettings, { SUPPORTED_LANGUAGES } from './components/SpeechSettings';
 import SpeechControls from './components/SpeechControls';
 import AudioOutput from './components/AudioOutput';
+import { API_BASE_URL } from './config/api';
 
 export default function App() {
   const [text, setText] = useState(
@@ -40,7 +41,7 @@ export default function App() {
 
   const checkHealth = async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(`${API_BASE_URL}/api/health`);
       if (res.ok) {
         const data = await res.json();
         setBackendStatus({
@@ -65,7 +66,7 @@ export default function App() {
     async function loadVoices() {
       setIsLoadingVoices(true);
       try {
-        const res = await fetch(`/api/voices?locale=${encodeURIComponent(selectedLocale)}`);
+        const res = await fetch(`${API_BASE_URL}/api/voices?locale=${encodeURIComponent(selectedLocale)}`);
         if (!res.ok) {
           throw new Error(`Failed to load voices (HTTP ${res.status})`);
         }
@@ -153,7 +154,7 @@ export default function App() {
     setErrorMessage('');
 
     try {
-      const response = await fetch('/api/speech', {
+      const response = await fetch(`${API_BASE_URL}/api/speech`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -212,7 +213,7 @@ export default function App() {
       console.error('Speech generation error:', err);
       let userMsg = err.message || 'Speech generation failed.';
       if (err.name === 'TypeError' && err.message.includes('fetch')) {
-        userMsg = 'Cannot reach backend server. Please verify that the server is running on port 5000.';
+        userMsg = `Cannot reach backend server at ${API_BASE_URL}. Please verify that the backend is running.`;
       }
       setErrorMessage(userMsg);
     } finally {
