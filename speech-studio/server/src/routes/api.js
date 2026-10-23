@@ -15,6 +15,8 @@ router.get('/health', (req, res) => {
     azure: {
       configured: status.configured,
       region: status.region,
+      endpoint: status.endpoint,
+      provider: status.provider,
       hasKey: status.hasKey
     }
   });

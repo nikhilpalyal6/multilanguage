@@ -18,8 +18,17 @@ function escapeXml(unsafe) {
 }
 
 /**
+ * Masks sensitive keys/tokens from error messages and logs.
+ */
+function sanitize(message, secret) {
+  if (!message || typeof message !== 'string') return '';
+  if (!secret || secret.length < 5) return message;
+  return message.split(secret).join('[REDACTED_KEY]');
+}
+
+/**
  * Official fallback Azure Neural Voice list for primary locales.
- * Used when Azure key is pending configuration or as an instant cache.
+ * Used when network is unreachable or as an initial baseline.
  */
 const OFFICIAL_VOICE_CATALOG = [
   // English (India)
@@ -69,22 +78,32 @@ class AzureSpeechService {
   }
 
   refreshConfig() {
-    this.speechKey = process.env.AZURE_SPEECH_KEY?.trim() || '';
-    this.speechRegion = process.env.AZURE_SPEECH_REGION?.trim() || '';
-    this.foundryApiKey = process.env.FOUNDRY_API_KEY?.trim() || '';
-    this.foundryEndpoint = process.env.FOUNDRY_ENDPOINT?.trim() || '';
+    this.speechKey = (process.env.AZURE_SPEECH_KEY || process.env.FOUNDRY_API_KEY || '').trim();
+    this.speechRegion = (process.env.AZURE_SPEECH_REGION || '').trim();
+    this.speechEndpoint = (process.env.AZURE_SPEECH_ENDPOINT || process.env.FOUNDRY_ENDPOINT || '').trim();
 
-    // If Azure key is a placeholder or empty, but FOUNDRY_API_KEY is available, use it
-    if ((!this.speechKey || this.speechKey === 'your_actual_key' || this.speechKey === 'your_azure_speech_key') && this.foundryApiKey) {
-      this.speechKey = this.foundryApiKey;
+    // If user mistakenly put the endpoint URL in AZURE_SPEECH_REGION, normalize it
+    if (this.speechRegion.startsWith('http://') || this.speechRegion.startsWith('https://')) {
+      if (!this.speechEndpoint) {
+        this.speechEndpoint = this.speechRegion;
+      }
+      this.speechRegion = '';
+    }
+
+    // Default known endpoint for this Microsoft Foundry resource if key matches
+    if (!this.speechEndpoint && this.speechKey.startsWith('7Xi4i')) {
+      this.speechEndpoint = 'https://nikhil-foundry-resource.cognitiveservices.azure.com/';
     }
   }
 
   isConfigured() {
     this.refreshConfig();
-    const hasFoundry = Boolean(this.foundryEndpoint && this.foundryApiKey && this.foundryApiKey !== 'your_actual_key');
-    const hasAzure = Boolean(this.speechKey && this.speechRegion && this.speechKey !== 'your_actual_key' && this.speechKey !== 'your_azure_speech_key');
-    return hasFoundry || hasAzure;
+    return Boolean(
+      this.speechKey &&
+      this.speechKey !== 'your_actual_key' &&
+      this.speechKey !== 'your_azure_speech_key' &&
+      (this.speechRegion || this.speechEndpoint)
+    );
   }
 
   getConfigStatus() {
@@ -92,38 +111,67 @@ class AzureSpeechService {
     return {
       configured: this.isConfigured(),
       region: this.speechRegion || null,
-      hasKey: Boolean(this.speechKey || this.foundryApiKey),
-      provider: this.foundryEndpoint ? 'Microsoft Foundry Endpoint' : 'Azure Speech Subscription'
+      endpoint: this.speechEndpoint ? this.speechEndpoint.replace(/\/+$/, '') : null,
+      hasKey: Boolean(this.speechKey && this.speechKey !== 'your_actual_key'),
+      provider: this.speechEndpoint ? 'Microsoft Foundry Endpoint' : 'Azure Speech Regional Subscription'
     };
   }
 
   /**
-   * Helper to create SpeechConfig from either Microsoft Foundry endpoint or Azure Subscription
+   * Builds prioritized connection strategies based on configuration and resource type.
    */
-  createSpeechConfig() {
+  getConnectionCandidates() {
     this.refreshConfig();
+    const candidates = [];
 
-    // 1. Prefer Microsoft Foundry endpoint if provided
-    if (this.foundryEndpoint && this.foundryApiKey && this.foundryApiKey !== 'your_actual_key') {
+    // 1. Explicit Endpoint (Recommended for Microsoft Foundry / Azure AI Services)
+    if (this.speechEndpoint) {
       try {
-        const url = new URL(this.foundryEndpoint);
-        return sdk.SpeechConfig.fromEndpoint(url, this.foundryApiKey);
+        const url = new URL(this.speechEndpoint);
+        candidates.push({
+          type: 'endpoint',
+          target: url.href,
+          configFactory: () => sdk.SpeechConfig.fromEndpoint(url, this.speechKey)
+        });
       } catch (err) {
-        console.warn('[AzureSpeechService] Failed to create SpeechConfig from Foundry endpoint:', err.message);
+        console.warn('[AzureSpeechService] Invalid endpoint URL:', err.message);
       }
     }
 
-    // 2. Use Azure Speech key and region
-    if (this.speechKey && this.speechRegion && this.speechKey !== 'your_actual_key' && this.speechKey !== 'your_azure_speech_key') {
-      return sdk.SpeechConfig.fromSubscription(this.speechKey, this.speechRegion);
+    // 2. Explicit Regional Subscription (if configured)
+    if (this.speechRegion) {
+      const reg = this.speechRegion;
+      candidates.push({
+        type: 'region',
+        target: reg,
+        configFactory: () => sdk.SpeechConfig.fromSubscription(this.speechKey, reg)
+      });
     }
 
-    return null;
+    // 3. Known region fallback for Southeast Asia (where nikhil-foundry-resource is located in Azure)
+    if (this.speechRegion.toLowerCase() === 'centralindia' || this.speechRegion.toLowerCase() === 'southasia' || !this.speechRegion) {
+      candidates.push({
+        type: 'region',
+        target: 'southeastasia',
+        configFactory: () => sdk.SpeechConfig.fromSubscription(this.speechKey, 'southeastasia')
+      });
+    }
+
+    // 4. Fallback custom endpoint if not already added
+    const defaultFoundry = 'https://nikhil-foundry-resource.cognitiveservices.azure.com/';
+    if (!candidates.some(c => c.target === defaultFoundry)) {
+      candidates.push({
+        type: 'endpoint',
+        target: defaultFoundry,
+        configFactory: () => sdk.SpeechConfig.fromEndpoint(new URL(defaultFoundry), this.speechKey)
+      });
+    }
+
+    return candidates;
   }
 
   /**
-   * Retrieves voices from Azure Speech SDK dynamically.
-   * If credentials are not yet set or SDK call fails, falls back gracefully to official list.
+   * Retrieves voices from Azure Speech dynamically with candidate fallback.
    */
   async getVoices(locale) {
     if (!this.isConfigured()) {
@@ -134,80 +182,65 @@ class AzureSpeechService {
       return voices;
     }
 
-    try {
-      const speechConfig = this.createSpeechConfig();
-      if (!speechConfig) {
-        let voices = OFFICIAL_VOICE_CATALOG;
-        if (locale) {
-          voices = voices.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
+    const candidates = this.getConnectionCandidates();
+
+    for (const candidate of candidates) {
+      try {
+        const speechConfig = candidate.configFactory();
+        const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
+
+        const result = await new Promise((resolve, reject) => {
+          synthesizer.getVoicesAsync(locale || '')
+            .then(res => {
+              synthesizer.close();
+              resolve(res);
+            })
+            .catch(err => {
+              synthesizer.close();
+              reject(err);
+            });
+        });
+
+        if (result.reason === sdk.ResultReason.VoicesListRetrieved && Array.isArray(result.voices) && result.voices.length > 0) {
+          let voices = result.voices.map(v => ({
+            name: v.name || v.shortName,
+            displayName: v.displayName || v.localName || v.name,
+            localName: v.localName || v.displayName || v.name,
+            locale: v.locale,
+            localeName: v.localeName || v.locale,
+            gender: v.gender === 1 ? 'Female' : v.gender === 2 ? 'Male' : 'Neutral',
+            styleList: Array.isArray(v.styleList) ? v.styleList : [],
+            voiceType: v.voiceType
+          }));
+
+          if (locale) {
+            voices = voices.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
+          }
+
+          if (voices.length > 0) {
+            return voices;
+          }
         }
-        return voices;
+      } catch (err) {
+        console.warn(`[AzureSpeechService] getVoices failed on ${candidate.type} (${candidate.target}):`, sanitize(err.message, this.speechKey));
       }
-
-      const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
-
-      return await new Promise((resolve) => {
-        synthesizer.getVoicesAsync(locale || '')
-          .then((result) => {
-            synthesizer.close();
-            if (result.reason === sdk.ResultReason.VoicesListRetrieved && Array.isArray(result.voices)) {
-              let voices = result.voices.map(v => ({
-                name: v.name || v.shortName,
-                displayName: v.displayName || v.localName || v.name,
-                localName: v.localName || v.displayName || v.name,
-                locale: v.locale,
-                localeName: v.localeName || v.locale,
-                gender: v.gender === 1 ? 'Female' : v.gender === 2 ? 'Male' : 'Neutral',
-                styleList: Array.isArray(v.styleList) ? v.styleList : [],
-                voiceType: v.voiceType
-              }));
-
-              if (locale) {
-                voices = voices.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
-              }
-
-              if (voices.length === 0) {
-                const catalogFallback = OFFICIAL_VOICE_CATALOG.filter(v => !locale || v.locale.toLowerCase() === locale.toLowerCase());
-                resolve(catalogFallback);
-              } else {
-                resolve(voices);
-              }
-            } else {
-              console.warn('[AzureSpeechService] getVoicesAsync returned non-success:', result.errorDetails);
-              let fallback = OFFICIAL_VOICE_CATALOG;
-              if (locale) {
-                fallback = fallback.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
-              }
-              resolve(fallback);
-            }
-          })
-          .catch((err) => {
-            synthesizer.close();
-            console.warn('[AzureSpeechService] getVoicesAsync error, using catalog fallback:', err.message);
-            let fallback = OFFICIAL_VOICE_CATALOG;
-            if (locale) {
-              fallback = fallback.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
-            }
-            resolve(fallback);
-          });
-      });
-    } catch (err) {
-      console.warn('[AzureSpeechService] Exception initializing synthesizer for getVoices:', err.message);
-      let fallback = OFFICIAL_VOICE_CATALOG;
-      if (locale) {
-        fallback = fallback.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
-      }
-      return fallback;
     }
+
+    // If live retrieval across all candidates failed, fallback safely to official catalog
+    let fallback = OFFICIAL_VOICE_CATALOG;
+    if (locale) {
+      fallback = fallback.filter(v => v.locale.toLowerCase() === locale.toLowerCase());
+    }
+    return fallback;
   }
 
   /**
    * Synthesizes text into natural speech using Azure Speech SDK.
-   * Returns a Buffer containing the WAV audio.
+   * Retries across compatible candidates (e.g. endpoint and correct region) if connection 1006 occurs.
    */
   async synthesizeSpeech({ text, voiceName, locale, style }) {
     if (!this.isConfigured()) {
-      const error = new Error('Azure Speech credentials are not configured. Please add your Key and Endpoint / Region in server/.env.');
+      const error = new Error('Azure Speech credentials are not configured. Please set AZURE_SPEECH_KEY and AZURE_SPEECH_ENDPOINT / AZURE_SPEECH_REGION.');
       error.statusCode = 401;
       error.code = 'CREDENTIALS_MISSING';
       throw error;
@@ -242,112 +275,125 @@ class AzureSpeechService {
         `</speak>`;
     }
 
-    let speechConfig;
-    try {
-      speechConfig = this.createSpeechConfig();
-      if (!speechConfig) {
-        throw new Error('Unable to construct Azure Speech configuration from environment.');
+    const candidates = this.getConnectionCandidates();
+    let lastError = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      try {
+        console.log(`[AzureSpeechService] Attempting speech synthesis via ${candidate.type}: ${candidate.target}`);
+        const speechConfig = candidate.configFactory();
+        speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm;
+
+        const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
+
+        const result = await new Promise((resolve, reject) => {
+          const timeoutHandle = setTimeout(() => {
+            try { synthesizer.close(); } catch (_) {}
+            const timeoutErr = new Error(`Speech synthesis request timed out after 30 seconds via ${candidate.type} (${candidate.target}).`);
+            timeoutErr.statusCode = 504;
+            timeoutErr.code = 'TIMEOUT';
+            reject(timeoutErr);
+          }, 30000);
+
+          synthesizer.speakSsmlAsync(
+            ssml,
+            (res) => {
+              clearTimeout(timeoutHandle);
+              try { synthesizer.close(); } catch (_) {}
+
+              if (res.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
+                if (!res.audioData || res.audioData.byteLength === 0) {
+                  const emptyAudioErr = new Error('Azure Speech returned an empty audio stream.');
+                  emptyAudioErr.statusCode = 502;
+                  return reject(emptyAudioErr);
+                }
+                const buffer = Buffer.from(res.audioData);
+                resolve({
+                  buffer,
+                  mimeType: 'audio/wav',
+                  format: 'riff-24khz-16bit-mono-pcm',
+                  length: buffer.length
+                });
+              } else if (res.reason === sdk.ResultReason.Canceled) {
+                let errorDetails = res.errorDetails || '';
+                let cancellationReason = '';
+
+                try {
+                  if (sdk.CancellationDetails && typeof sdk.CancellationDetails.fromResult === 'function') {
+                    const cancellation = sdk.CancellationDetails.fromResult(res);
+                    errorDetails = cancellation.errorDetails || errorDetails;
+                    cancellationReason = cancellation.Reason || cancellation.reason || '';
+                  }
+                } catch (detErr) {
+                  console.warn('[AzureSpeechService] Could not parse CancellationDetails:', detErr);
+                }
+
+                const safeDetails = sanitize(errorDetails, this.speechKey);
+                console.error(`[AzureSpeechService] Attempt failed (${candidate.type}: ${candidate.target}):`, {
+                  reason: cancellationReason,
+                  errorDetails: safeDetails
+                });
+
+                let message = `Azure Speech synthesis canceled: ${safeDetails || cancellationReason || 'Unknown error'}`;
+                let statusCode = 500;
+                let code = 'SYNTHESIS_CANCELED';
+
+                if (safeDetails.includes('1006') || safeDetails.includes('contact server')) {
+                  message = `Cannot contact Azure Speech server at ${candidate.target}. Please verify region / endpoint compatibility.`;
+                  statusCode = 502;
+                  code = 'SERVER_CONNECTION_FAILED';
+                } else if (safeDetails.includes('401') || safeDetails.includes('Unauthorized') || safeDetails.includes('Authentication failed')) {
+                  message = 'Invalid Azure Speech API Key. Please verify your credentials in server/.env.';
+                  statusCode = 401;
+                  code = 'INVALID_KEY';
+                } else if (safeDetails.includes('404') || safeDetails.includes('Region') || safeDetails.includes('Not Found')) {
+                  message = `Azure Speech service not found at region or endpoint. Please verify server/.env.`;
+                  statusCode = 404;
+                  code = 'INVALID_REGION';
+                } else if (safeDetails.includes('429') || safeDetails.includes('TooManyRequests') || safeDetails.includes('quota')) {
+                  message = 'Azure Speech service rate limit or quota exceeded. Please try again in a few moments.';
+                  statusCode = 429;
+                  code = 'RATE_LIMIT_EXCEEDED';
+                } else if (safeDetails.includes('Voice') || safeDetails.includes('SSML')) {
+                  message = `Speech synthesis failed for voice "${targetVoice}": ${safeDetails}`;
+                  statusCode = 400;
+                  code = 'VOICE_OR_SSML_ERROR';
+                }
+
+                const cancelErr = new Error(message);
+                cancelErr.statusCode = statusCode;
+                cancelErr.code = code;
+                cancelErr.details = safeDetails;
+                reject(cancelErr);
+              } else {
+                const unknownErr = new Error(`Speech synthesis ended with unexpected status: ${res.reason}`);
+                unknownErr.statusCode = 500;
+                reject(unknownErr);
+              }
+            },
+            (err) => {
+              clearTimeout(timeoutHandle);
+              try { synthesizer.close(); } catch (_) {}
+              const safeErr = sanitize(err.message || String(err), this.speechKey);
+              const errorObj = new Error(`Azure Speech SDK error: ${safeErr}`);
+              errorObj.statusCode = 500;
+              reject(errorObj);
+            }
+          );
+        });
+
+        // Successful generation! Return result
+        console.log(`[AzureSpeechService] Speech synthesis SUCCEEDED via ${candidate.type}: ${candidate.target} (${result.length} bytes)`);
+        return result;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[AzureSpeechService] Candidate ${candidate.type} (${candidate.target}) failed, checking next candidate...`);
       }
-      // Generate clean 24kHz 16-bit mono PCM WAV (standard high-fidelity playback in all browsers)
-      speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm;
-    } catch (err) {
-      const error = new Error(`Failed to initialize Azure Speech configuration: ${err.message}`);
-      error.statusCode = 500;
-      throw error;
     }
 
-    const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
-
-    return new Promise((resolve, reject) => {
-      // Set a 30s timeout safety guard
-      const timeoutHandle = setTimeout(() => {
-        try { synthesizer.close(); } catch (_) {}
-        const timeoutErr = new Error('Speech synthesis request timed out after 30 seconds.');
-        timeoutErr.statusCode = 504;
-        timeoutErr.code = 'TIMEOUT';
-        reject(timeoutErr);
-      }, 30000);
-
-      synthesizer.speakSsmlAsync(
-        ssml,
-        (result) => {
-          try {
-            clearTimeout(timeoutHandle);
-            synthesizer.close();
-
-            if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
-              if (!result.audioData || result.audioData.byteLength === 0) {
-                const emptyAudioErr = new Error('Azure Speech returned an empty audio stream.');
-                emptyAudioErr.statusCode = 502;
-                return reject(emptyAudioErr);
-              }
-              const buffer = Buffer.from(result.audioData);
-              resolve({
-                buffer,
-                mimeType: 'audio/wav',
-                format: 'riff-24khz-16bit-mono-pcm',
-                length: buffer.length
-              });
-            } else if (result.reason === sdk.ResultReason.Canceled) {
-              let errorDetails = result.errorDetails || '';
-              let cancellationReason = '';
-
-              try {
-                if (sdk.CancellationDetails && typeof sdk.CancellationDetails.fromResult === 'function') {
-                  const cancellation = sdk.CancellationDetails.fromResult(result);
-                  errorDetails = cancellation.errorDetails || errorDetails;
-                  cancellationReason = cancellation.Reason || cancellation.reason || '';
-                }
-              } catch (detErr) {
-                console.warn('[AzureSpeechService] Could not parse CancellationDetails:', detErr);
-              }
-
-              let message = `Azure Speech synthesis canceled: ${errorDetails || cancellationReason || 'Unknown error'}`;
-              let statusCode = 500;
-              let code = 'SYNTHESIS_CANCELED';
-
-              const details = errorDetails || '';
-              if (details.includes('401') || details.includes('Unauthorized') || details.includes('Authentication failed')) {
-                message = 'Invalid Azure Speech API Key. Please verify your credentials in server/.env.';
-                statusCode = 401;
-                code = 'INVALID_KEY';
-              } else if (details.includes('404') || details.includes('Region') || details.includes('Not Found')) {
-                message = `Azure Speech service not found at region or endpoint. Please verify server/.env.`;
-                statusCode = 404;
-                code = 'INVALID_REGION';
-              } else if (details.includes('429') || details.includes('TooManyRequests') || details.includes('quota')) {
-                message = 'Azure Speech service rate limit or quota exceeded. Please try again in a few moments.';
-                statusCode = 429;
-                code = 'RATE_LIMIT_EXCEEDED';
-              } else if (details.includes('Voice') || details.includes('SSML')) {
-                message = `Speech synthesis failed for voice "${targetVoice}": ${details}`;
-                statusCode = 400;
-                code = 'VOICE_OR_SSML_ERROR';
-              }
-
-              const cancelErr = new Error(message);
-              cancelErr.statusCode = statusCode;
-              cancelErr.code = code;
-              cancelErr.details = errorDetails;
-              reject(cancelErr);
-            } else {
-              const unknownErr = new Error(`Speech synthesis ended with unexpected status: ${result.reason}`);
-              unknownErr.statusCode = 500;
-              reject(unknownErr);
-            }
-          } catch (innerErr) {
-            reject(innerErr);
-          }
-        },
-        (error) => {
-          clearTimeout(timeoutHandle);
-          try { synthesizer.close(); } catch (_) {}
-          const err = new Error(`Azure Speech SDK error: ${error}`);
-          err.statusCode = 500;
-          reject(err);
-        }
-      );
-    });
+    // All candidates failed
+    throw lastError || new Error('Speech synthesis failed across all configured candidates.');
   }
 }
 
