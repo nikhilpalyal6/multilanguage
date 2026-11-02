@@ -23,6 +23,7 @@ export default function App() {
   const [audioBlob, setAudioBlob] = useState(null);
   const [audioFileName, setAudioFileName] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
 
   // Backend / Azure status
   const [backendStatus, setBackendStatus] = useState({
@@ -203,6 +204,7 @@ export default function App() {
       // Trigger playback smoothly
       setTimeout(() => {
         if (audioRef.current) {
+          audioRef.current.playbackRate = playbackSpeed;
           audioRef.current.play().catch((playErr) => {
             // Autoplay may be restricted by browser until user gesture, which is normal
             console.log('Autoplay deferred for user gesture:', playErr.message);
@@ -280,6 +282,8 @@ export default function App() {
             voiceName={selectedVoiceName}
             locale={selectedLocale}
             audioRef={audioRef}
+            playbackSpeed={playbackSpeed}
+            onSpeedChange={setPlaybackSpeed}
             onPlay={() => setIsPlaying(true)}
             onPause={() => setIsPlaying(false)}
             onEnded={() => setIsPlaying(false)}

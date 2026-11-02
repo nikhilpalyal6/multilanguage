@@ -1,4 +1,6 @@
-import React from 'react';
+import React, { useEffect } from 'react';
+
+const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
 export default function AudioOutput({
   audioUrl,
@@ -7,12 +9,45 @@ export default function AudioOutput({
   voiceName,
   locale,
   audioRef,
+  playbackSpeed = 1,
+  onSpeedChange,
   onPlay,
   onPause,
   onEnded,
   onClearAudio
 }) {
   if (!audioUrl) return null;
+
+  // Ensure audio element playback rate stays in sync with playbackSpeed state
+  useEffect(() => {
+    if (audioRef?.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+    }
+  }, [playbackSpeed, audioUrl, audioRef]);
+
+  const handleSpeedSelect = (speed) => {
+    if (onSpeedChange) {
+      onSpeedChange(speed);
+    }
+    if (audioRef?.current) {
+      audioRef.current.playbackRate = speed;
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (audioRef?.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+    }
+  };
+
+  const handlePlayInternal = (e) => {
+    if (audioRef?.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+    }
+    if (onPlay) {
+      onPlay(e);
+    }
+  };
 
   const handleDownload = () => {
     if (!audioBlob) return;
@@ -54,10 +89,36 @@ export default function AudioOutput({
           src={audioUrl}
           controls
           className="html5-audio-player"
-          onPlay={onPlay}
+          onLoadedMetadata={handleLoadedMetadata}
+          onPlay={handlePlayInternal}
           onPause={onPause}
           onEnded={onEnded}
         />
+
+        {/* Audio Playback Speed Selector */}
+        <div className="speed-controller">
+          <div className="speed-controller-label">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="speed-icon">
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
+            </svg>
+            <span>Playback Speed:</span>
+          </div>
+          <div className="speed-options" role="group" aria-label="Audio playback speed">
+            {PLAYBACK_SPEEDS.map((speed) => (
+              <button
+                key={speed}
+                type="button"
+                className={`speed-btn ${playbackSpeed === speed ? 'active' : ''}`}
+                onClick={() => handleSpeedSelect(speed)}
+                title={`Set audio playback speed to ${speed}x`}
+                aria-pressed={playbackSpeed === speed}
+              >
+                {speed === 1 ? '1x (Normal)' : `${speed}x`}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div className="output-details-bar">
           <div className="file-meta">
